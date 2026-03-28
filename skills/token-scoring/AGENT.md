@@ -30,7 +30,7 @@
 - Report which components are missing in the output
 
 ## On success
-- Return full score breakdown with all 5 components
+- Return full score breakdown with all 11 factors across 4 categories
 - Include dual-gate pass/fail status
 - Include classification (hot/qualified/watch/skip)
 - Include any flags (pump_fun, low_liquidity, concentrated_wallets)

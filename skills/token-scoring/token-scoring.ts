@@ -1,11 +1,12 @@
 /**
- * Token Scoring — 5-layer composite scoring engine
+ * Token Scoring — 4-category composite scoring engine (11 factors, max 100)
  * BFF Skills Competition | AIBTC x Bitflow
  * Author: buzzbysolcex (Ionic Nova / Buzz BD Agent)
  *
- * Scores tokens on safety, wallet forensics, technical, social, and market metrics.
+ * 4 categories: Market (30pts), Safety (30pts), Social (20pts), Quality (20pts)
  * Dual-gate: fundamentals AND market must independently clear 60%.
  * Classification: HOT (85+), QUALIFIED (70-84), WATCH (50-69), SKIP (<50).
+ * Chains: Solana, Base, BSC, Stacks (SIP-010)
  *
  * Usage:
  *   bun run token-scoring/token-scoring.ts doctor
@@ -15,6 +16,7 @@
 const DEXSCREENER_API = "https://api.dexscreener.com";
 const COINGECKO_API = "https://api.coingecko.com/api/v3";
 const RUGCHECK_API = "https://api.rugcheck.xyz/v1";
+const HIRO_API = "https://api.mainnet.hiro.so";
 
 // ═══════════════════════════════════════
 // SCORING FACTORS (11 factors, max 100)
@@ -96,6 +98,24 @@ async function fetchRugCheck(address: string): Promise<any> {
     score: data.score || 50,
     verdict: data.verdict || "unknown",
     risks: data.risks || []
+  };
+}
+
+// ═══════════════════════════════════════
+// STACKS SIP-010 TOKEN LOOKUP (Hiro API)
+// ═══════════════════════════════════════
+
+async function fetchStacksToken(contractId: string): Promise<any> {
+  // contractId format: SP...address.token-name
+  const data = await fetchJSON(`${HIRO_API}/extended/v1/tokens/ft/metadata/${contractId}`);
+  if (!data) return null;
+  return {
+    found: true,
+    name: data.name || null,
+    symbol: data.symbol || null,
+    decimals: data.decimals || 0,
+    total_supply: data.total_supply || "0",
+    description: data.description || null
   };
 }
 
@@ -202,6 +222,9 @@ async function doctor() {
   const rc = await fetchJSON(`${RUGCHECK_API}/tokens/So11111111111111111111111111111111111111112/report/summary`);
   checks.rugcheck = rc ? "ok" : "error";
 
+  const hiro = await fetchJSON(`${HIRO_API}/v2/info`);
+  checks.hiro_stacks = hiro?.stacks_tip_height ? "ok" : "error";
+
   const allOk = Object.values(checks).every(v => v === "ok");
 
   console.log(JSON.stringify({
@@ -217,7 +240,7 @@ async function run(address?: string, chain?: string) {
   if (!address) {
     const trending = await fetchJSON(`${DEXSCREENER_API}/token-boosts/top/v1`);
     if (Array.isArray(trending) && trending.length > 0) {
-      const first = trending.find((t: any) => ["solana", "base", "bsc"].includes(t.chainId));
+      const first = trending.find((t: any) => ["solana", "base", "bsc", "stacks"].includes(t.chainId));
       if (first) {
         address = first.tokenAddress;
         chain = first.chainId;
@@ -236,6 +259,15 @@ async function run(address?: string, chain?: string) {
 
   chain = chain || "solana";
   const flags: string[] = [];
+
+  // Stacks SIP-010 enrichment
+  let stacksData: any = null;
+  if (chain === "stacks" && address.includes(".")) {
+    stacksData = await fetchStacksToken(address);
+    if (stacksData?.found) {
+      flags.push("stacks_sip010");
+    }
+  }
 
   // Fetch data from all sources
   const [dexData, cgData, rugData] = await Promise.all([
@@ -266,10 +298,26 @@ async function run(address?: string, chain?: string) {
   const safetyScore = scoreSafety(rugData);
   const holderScore = scoreHolderDist(cgData);
   const ageScore = scoreTokenAge(dexData.pair_created_at);
-  const deployerScore = 3; // Default without deep chain analysis
+  // deployer_history: pump.fun detection + pair age as proxy for deployer quality
+  let deployerScore = 3;
+  if (isPumpFun(address)) deployerScore = 1; // pump.fun deployers are anonymous
+  else if (ageScore >= 4) deployerScore = 4; // long-lived pairs suggest committed deployer
+
+  // web_footprint: CoinGecko listing = project has website, docs, team page
   const webScore = cgData?.found ? 4 : 2;
-  const momentumScore = dexData.price_change_24h > 0 ? 4 : 2;
+
+  // momentum: 24h price change magnitude (not just direction)
+  let momentumScore = 2;
+  const priceChange = Math.abs(dexData.price_change_24h || 0);
+  if (dexData.price_change_24h > 5) momentumScore = 5;      // strong positive
+  else if (dexData.price_change_24h > 0) momentumScore = 4;  // mild positive
+  else if (dexData.price_change_24h > -10) momentumScore = 3; // mild negative
+  else momentumScore = 1;                                      // heavy dump
+
+  // team_identity: CoinGecko listing as proxy (listed projects have verified team info)
   const teamScore = cgData?.found ? 6 : 3;
+
+  // social_presence: CoinGecko listing as proxy (listed = community verified)
   const socialScore = cgData?.found ? 6 : 3;
 
   // Apply pump.fun penalty
